@@ -1,5 +1,5 @@
-import { SurveymateWorkspace } from "@/components/surveymate-workspace";
+import { WorkerHomePage } from "@/components/worker-home-page";
 
 export default function Home() {
-  return <SurveymateWorkspace />;
+  return <WorkerHomePage />;
 }
