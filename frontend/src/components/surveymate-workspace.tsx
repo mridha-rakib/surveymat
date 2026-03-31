@@ -7,6 +7,7 @@ import {
   type ComponentType,
   type ReactNode,
 } from "react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import {
   ArrowRight,
@@ -25,6 +26,7 @@ import {
   Search,
   Send,
   ShieldCheck,
+  LogOut,
   Sparkles,
   Star,
   TrendingUp,
@@ -43,6 +45,10 @@ import {
   type TaskStatus,
   type WorkspaceState,
 } from "@/lib/surveymate-data";
+import {
+  clearWorkerSession,
+  writeWorkerSession,
+} from "@/lib/worker-session";
 
 const STORAGE_KEY = "surveymate-user-workspace-v3";
 
@@ -101,6 +107,14 @@ const formatDate = (value: string) =>
     month: "short",
     day: "numeric",
     year: "numeric",
+  }).format(new Date(value));
+
+const formatDateTime = (value: string) =>
+  new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
   }).format(new Date(value));
 
 const getStatusTone = (status: TaskStatus) => {
@@ -176,7 +190,33 @@ function StatusPill({ status }: { status: TaskStatus }) {
   );
 }
 
-export function SurveymateWorkspace() {
+type SurveymateWorkspaceProps = {
+  routeView?: NavView;
+  routeTaskId?: string;
+};
+
+const getWorkerPath = (view: NavView, taskId?: string) => {
+  switch (view) {
+    case "dashboard":
+      return "/dashboard";
+    case "tasks":
+      return "/tasks";
+    case "detail":
+      return `/tasks/${taskId ?? "task-106"}`;
+    case "performance":
+      return "/performance";
+    case "earnings":
+      return "/earnings";
+    default:
+      return "/dashboard";
+  }
+};
+
+export function SurveymateWorkspace({
+  routeView,
+  routeTaskId,
+}: SurveymateWorkspaceProps = {}) {
+  const router = useRouter();
   const [workspace, setWorkspace] = useState<WorkspaceState>(() =>
     createInitialWorkspaceState()
   );
@@ -218,12 +258,48 @@ export function SurveymateWorkspace() {
     }
   }, [workspace, hydrated]);
 
+  useEffect(() => {
+    if (!routeView) {
+      return;
+    }
+
+    setWorkspace((current) => {
+      const nextTaskId =
+        routeView === "detail" && routeTaskId
+          ? routeTaskId
+          : current.selectedTaskId;
+
+      if (
+        current.activeView === routeView &&
+        current.selectedTaskId === nextTaskId
+      ) {
+        return current;
+      }
+
+      return {
+        ...current,
+        activeView: routeView,
+        selectedTaskId: nextTaskId,
+      };
+    });
+  }, [routeTaskId, routeView]);
+
+  const createDraftForTask = (task?: Task) =>
+    createEmptyDraft({
+      emailSubject: task?.subject ?? "",
+      emailBody: task?.messageTemplate ?? "",
+    });
+
   const selectedTask =
     workspace.tasks.find((task) => task.id === workspace.selectedTaskId) ??
     workspace.tasks[0];
   const selectedDraft = selectedTask
-    ? workspace.drafts[selectedTask.id] ?? createEmptyDraft()
-    : createEmptyDraft();
+    ? {
+        ...createDraftForTask(selectedTask),
+        ...(workspace.drafts[selectedTask.id] ?? {}),
+        screenshotNames: workspace.drafts[selectedTask.id]?.screenshotNames ?? [],
+      }
+    : createDraftForTask();
 
   const filteredTasks = workspace.tasks.filter((task) => {
     const matchesStatus = statusFilter === "all" || task.status === statusFilter;
@@ -251,9 +327,25 @@ export function SurveymateWorkspace() {
   const earliestPayoutDate = surveymateRules.nextPayoutDateLabel;
   const withdrawalReady =
     workspace.availableBalance >= surveymateRules.earlyPayoutThreshold;
+  const flowStageLabel = !selectedDraft.emailSent
+    ? "Ready to send"
+    : !selectedDraft.replyReceivedAt
+      ? "Waiting for response"
+      : selectedTask?.requiresFollowUp && !selectedDraft.followUpComplete
+        ? "Follow-up needed"
+        : !selectedDraft.proofReady || selectedDraft.screenshotNames.length === 0
+          ? "Collect proof"
+          : !selectedDraft.responseText.trim()
+            ? "Summarize reply"
+            : "Ready to submit";
+
+  const navigateToView = (view: NavView, taskId?: string) => {
+    router.push(getWorkerPath(view, taskId ?? workspace.selectedTaskId));
+  };
 
   const setActiveView = (view: NavView) => {
     setWorkspace((current) => ({ ...current, activeView: view }));
+    navigateToView(view);
   };
 
   const selectTask = (taskId: string, nextView: NavView = "detail") => {
@@ -264,18 +356,21 @@ export function SurveymateWorkspace() {
     }));
     setError(null);
     setMessage(null);
+    navigateToView(nextView, taskId);
   };
 
   const updateDraft = (
     taskId: string,
     patch: Partial<ReturnType<typeof createEmptyDraft>>
   ) => {
+    const task = workspace.tasks.find((entry) => entry.id === taskId);
     setWorkspace((current) => ({
       ...current,
       drafts: {
         ...current.drafts,
         [taskId]: {
-          ...(current.drafts[taskId] ?? createEmptyDraft()),
+          ...createDraftForTask(task),
+          ...(current.drafts[taskId] ?? {}),
           ...patch,
         },
       },
@@ -303,7 +398,48 @@ export function SurveymateWorkspace() {
           : entry
       ),
     }));
-    setMessage("Task opened. Work through the checklist and submit when ready.");
+    setMessage("Task opened. Send the email, wait for a reply, then upload proof and submit.");
+    setError(null);
+    navigateToView("detail", task.id);
+  };
+
+  const handleSendTaskEmail = () => {
+    if (!selectedTask) {
+      return;
+    }
+
+    if (!selectedDraft.emailSubject.trim() || !selectedDraft.emailBody.trim()) {
+      setError("Add both a subject and message before sending the email from the workspace.");
+      return;
+    }
+
+    updateDraft(selectedTask.id, {
+      emailSent: true,
+      sentAt: new Date().toISOString(),
+    });
+    setMessage("Email recorded as sent from the frontend flow. Now wait for the recipient reply.");
+    setError(null);
+  };
+
+  const handleCaptureReply = () => {
+    if (!selectedTask) {
+      return;
+    }
+
+    if (!selectedDraft.emailSent) {
+      setError("Send the task email first before capturing a recipient reply.");
+      return;
+    }
+
+    if (!selectedDraft.recipientReplyText.trim()) {
+      setError("Paste or write the recipient reply before marking it as received.");
+      return;
+    }
+
+    updateDraft(selectedTask.id, {
+      replyReceivedAt: selectedDraft.replyReceivedAt ?? new Date().toISOString(),
+    });
+    setMessage("Recipient reply captured. Continue with screenshots, summary, and sentiment.");
     setError(null);
   };
 
@@ -318,13 +454,27 @@ export function SurveymateWorkspace() {
       return;
     }
 
-    const draft = workspace.drafts[selectedTask.id] ?? createEmptyDraft();
+    const draft = {
+      ...createDraftForTask(selectedTask),
+      ...(workspace.drafts[selectedTask.id] ?? {}),
+      screenshotNames: workspace.drafts[selectedTask.id]?.screenshotNames ?? [],
+    };
     const followUpSatisfied =
       !selectedTask.requiresFollowUp || draft.followUpComplete;
 
-    if (!draft.emailSent || !draft.proofReady || !followUpSatisfied) {
+    if (!draft.emailSent) {
+      setError("Send the required email from the task workspace before submitting.");
+      return;
+    }
+
+    if (!draft.replyReceivedAt || !draft.recipientReplyText.trim()) {
+      setError("Capture the recipient reply before submitting this task.");
+      return;
+    }
+
+    if (!draft.proofReady || !followUpSatisfied) {
       setError(
-        "Complete the task checklist first: email sent, proof ready, and follow-up if required."
+        "Complete the remaining checklist first: proof ready and follow-up if required."
       );
       return;
     }
@@ -364,7 +514,7 @@ export function SurveymateWorkspace() {
       drafts: {
         ...current.drafts,
         [selectedTask.id]: {
-          ...createEmptyDraft(),
+          ...createDraftForTask(selectedTask),
           sentiment: draft.sentiment,
         },
       },
@@ -431,36 +581,46 @@ export function SurveymateWorkspace() {
       return;
     }
 
+    const nextProfile = {
+      workerId: workspace.profile?.workerId ?? defaultWorkerId,
+      fullName: onboarding.fullName.trim(),
+      email: onboarding.email.trim(),
+      region: onboarding.region,
+      payoutMethod: onboarding.payoutMethod,
+      joinedAt: new Date().toISOString(),
+      rulesAccepted: true,
+      status: workspace.workerStatus,
+    };
+
     setWorkspace((current) => ({
       ...current,
-      profile: {
-        workerId: current.profile?.workerId ?? defaultWorkerId,
-        fullName: onboarding.fullName.trim(),
-        email: onboarding.email.trim(),
-        region: onboarding.region,
-        payoutMethod: onboarding.payoutMethod,
-        joinedAt: new Date().toISOString(),
-        rulesAccepted: true,
-        status: current.workerStatus,
-      },
+      profile: nextProfile,
       activeView: "dashboard",
     }));
     setWithdrawMethod(onboarding.payoutMethod);
     setMessage("Account setup complete. Your worker dashboard is ready.");
     setError(null);
+    writeWorkerSession(nextProfile);
+    router.push("/dashboard");
   };
 
   const loadDemoWorkspace = () => {
-    setWorkspace(createDemoWorkspaceState());
+    const nextWorkspace = createDemoWorkspaceState();
+    setWorkspace(nextWorkspace);
     setOnboarding(defaultOnboarding);
     setWithdrawMethod("Payoneer");
     setWithdrawAmount(String(surveymateRules.earlyPayoutThreshold));
     setMessage("Demo worker loaded. You can inspect every user feature immediately.");
     setError(null);
+    if (nextWorkspace.profile) {
+      writeWorkerSession(nextWorkspace.profile);
+    }
+    router.push("/dashboard");
   };
 
   const resetWorkspace = () => {
     window.localStorage.removeItem(STORAGE_KEY);
+    clearWorkerSession();
     setWorkspace(createInitialWorkspaceState());
     setOnboarding(defaultOnboarding);
     setWithdrawMethod("Payoneer");
@@ -469,6 +629,14 @@ export function SurveymateWorkspace() {
     setStatusFilter("all");
     setMessage("Workspace reset. You can sign up again or load the demo worker.");
     setError(null);
+    router.push("/sign-in");
+  };
+
+  const signOut = () => {
+    clearWorkerSession();
+    setMessage(null);
+    setError(null);
+    router.push("/sign-in");
   };
 
   if (!hydrated) {
@@ -815,6 +983,14 @@ export function SurveymateWorkspace() {
             >
               <RefreshCcw className="size-4" />
               Demo
+            </Button>
+            <Button
+              variant="outline"
+              className="rounded-full border-[var(--brand-sky-200)] bg-white text-[var(--brand-sky-700)] hover:bg-[var(--brand-sky-50)]"
+              onClick={signOut}
+            >
+              <LogOut className="size-4" />
+              Sign Out
             </Button>
             <Button
               variant="outline"
@@ -1344,24 +1520,126 @@ export function SurveymateWorkspace() {
 
               <AppPanel
                 eyebrow="Submission"
-                title="Checklist, screenshots, and sentiment score"
+                title="Send, wait for reply, then complete submission"
                 action={
                   <div className="rounded-full bg-[var(--brand-sky-50)] px-4 py-2 text-sm font-medium text-[var(--brand-sky-700)]">
-                    Auto-saved locally
+                    {flowStageLabel}
                   </div>
                 }
               >
                 <div className="grid gap-4">
                   <div className="rounded-[1.75rem] border border-[var(--brand-sky-200)] bg-[var(--brand-sky-50)] p-5">
                     <p className="text-sm font-semibold text-[var(--brand-sky-900)]">
-                      Task checklist
+                      Step 1 - Send the task email
+                    </p>
+                    <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                      Prepare the outreach email inside the task workspace and
+                      confirm the send step before moving forward.
+                    </p>
+
+                    <div className="mt-4 grid gap-4">
+                      <label className="grid gap-2">
+                        <span className="text-sm font-medium text-[var(--brand-sky-800)]">
+                          Email subject
+                        </span>
+                        <input
+                          value={selectedDraft.emailSubject}
+                          onChange={(event) =>
+                            updateDraft(selectedTask.id, {
+                              emailSubject: event.target.value,
+                            })
+                          }
+                          className="h-12 rounded-2xl border border-[var(--brand-sky-200)] bg-white px-4 text-sm text-foreground outline-none transition focus:border-[var(--brand-sky-500)]"
+                        />
+                      </label>
+
+                      <label className="grid gap-2">
+                        <span className="text-sm font-medium text-[var(--brand-sky-800)]">
+                          Email body
+                        </span>
+                        <textarea
+                          value={selectedDraft.emailBody}
+                          onChange={(event) =>
+                            updateDraft(selectedTask.id, {
+                              emailBody: event.target.value,
+                            })
+                          }
+                          className="min-h-36 rounded-[1.5rem] border border-[var(--brand-sky-200)] bg-white px-4 py-4 text-sm leading-7 text-foreground outline-none transition focus:border-[var(--brand-sky-500)]"
+                        />
+                      </label>
+
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Button className="rounded-full" onClick={handleSendTaskEmail}>
+                          <Send className="size-4" />
+                          {selectedDraft.emailSent ? "Update Send Step" : "Send Email"}
+                        </Button>
+                        {selectedDraft.sentAt ? (
+                          <div className="rounded-full border border-[var(--brand-sky-200)] bg-white px-4 py-2 text-sm font-medium text-[var(--brand-sky-700)]">
+                            Sent {formatDateTime(selectedDraft.sentAt)}
+                          </div>
+                        ) : (
+                          <div className="rounded-full border border-dashed border-[var(--brand-sky-200)] bg-white px-4 py-2 text-sm font-medium text-[var(--brand-sky-600)]">
+                            Not sent yet
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-[1.75rem] border border-[var(--brand-sky-200)] bg-[var(--brand-sky-50)] p-5">
+                    <p className="text-sm font-semibold text-[var(--brand-sky-900)]">
+                      Step 2 - Wait for and capture the reply
+                    </p>
+                    <p className="mt-2 text-sm leading-6 text-muted-foreground">
+                      After sending, the task moves into a waiting state. Once
+                      the recipient replies, capture that message here before
+                      preparing proof and submission.
+                    </p>
+
+                    <div className="mt-4 rounded-[1.35rem] border border-white bg-white px-4 py-4 text-sm leading-6 text-[var(--brand-sky-800)]">
+                      {!selectedDraft.emailSent ? (
+                        "Send the task email first. The reply step unlocks after the send action is completed."
+                      ) : selectedDraft.replyReceivedAt ? (
+                        <>Reply captured on {formatDateTime(selectedDraft.replyReceivedAt)}.</>
+                      ) : (
+                        "The task is currently waiting for a recipient response."
+                      )}
+                    </div>
+
+                    <label className="mt-4 grid gap-2">
+                      <span className="text-sm font-medium text-[var(--brand-sky-800)]">
+                        Recipient reply
+                      </span>
+                      <textarea
+                        value={selectedDraft.recipientReplyText}
+                        onChange={(event) =>
+                          updateDraft(selectedTask.id, {
+                            recipientReplyText: event.target.value,
+                          })
+                        }
+                        className="min-h-32 rounded-[1.5rem] border border-[var(--brand-sky-200)] bg-white px-4 py-4 text-sm leading-7 text-foreground outline-none transition focus:border-[var(--brand-sky-500)]"
+                        placeholder="Paste or write the recipient's latest response here."
+                      />
+                    </label>
+
+                    <div className="mt-4 flex flex-wrap items-center gap-3">
+                      <Button
+                        variant="outline"
+                        className="rounded-full border-[var(--brand-sky-200)] bg-white text-[var(--brand-sky-700)] hover:bg-[var(--brand-sky-50)]"
+                        onClick={handleCaptureReply}
+                      >
+                        <MailCheck className="size-4" />
+                        Capture Reply
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="rounded-[1.75rem] border border-[var(--brand-sky-200)] bg-[var(--brand-sky-50)] p-5">
+                    <p className="text-sm font-semibold text-[var(--brand-sky-900)]">
+                      Step 3 - Completion checklist
                     </p>
                     <div className="mt-4 grid gap-3">
                       {[
-                        {
-                          key: "emailSent",
-                          label: "I sent the required email to the recipient.",
-                        },
                         {
                           key: "followUpComplete",
                           label: selectedTask.requiresFollowUp
@@ -1395,12 +1673,6 @@ export function SurveymateWorkspace() {
                             }
                             onChange={(event) => {
                               const checked = event.target.checked;
-                              if (item.key === "emailSent") {
-                                updateDraft(selectedTask.id, {
-                                  emailSent: checked,
-                                });
-                                return;
-                              }
 
                               if (item.key === "followUpComplete") {
                                 updateDraft(selectedTask.id, {
