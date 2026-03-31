@@ -42,6 +42,11 @@ export type Task = {
 
 export type TaskDraft = {
   emailSent: boolean;
+  emailSubject: string;
+  emailBody: string;
+  sentAt: string | null;
+  recipientReplyText: string;
+  replyReceivedAt: string | null;
   followUpComplete: boolean;
   proofReady: boolean;
   responseText: string;
@@ -130,8 +135,17 @@ export const taskCatalog: Task[] = sharedTasks.map((task) => ({
   requiresFollowUp: task.requiresFollowUp,
 }));
 
-export const createEmptyDraft = (): TaskDraft => ({
+export const createEmptyDraft = (
+  seed?: Partial<
+    Pick<TaskDraft, "emailSubject" | "emailBody" | "sentAt" | "recipientReplyText" | "replyReceivedAt">
+  >
+): TaskDraft => ({
   emailSent: false,
+  emailSubject: seed?.emailSubject ?? "",
+  emailBody: seed?.emailBody ?? "",
+  sentAt: seed?.sentAt ?? null,
+  recipientReplyText: seed?.recipientReplyText ?? "",
+  replyReceivedAt: seed?.replyReceivedAt ?? null,
   followUpComplete: false,
   proofReady: false,
   responseText: "",
@@ -147,7 +161,10 @@ export const createInitialDrafts = () =>
           ...task.draftSeed,
           screenshotNames: [...task.draftSeed.screenshotNames],
         }
-      : createEmptyDraft();
+      : createEmptyDraft({
+          emailSubject: task.subject,
+          emailBody: task.messageTemplate,
+        });
     return drafts;
   }, {});
 
