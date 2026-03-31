@@ -67,6 +67,11 @@ export type SharedSubmissionSeed = {
 
 export type SharedTaskDraftSeed = {
   emailSent: boolean;
+  emailSubject: string;
+  emailBody: string;
+  sentAt: string | null;
+  recipientReplyText: string;
+  replyReceivedAt: string | null;
   followUpComplete: boolean;
   proofReady: boolean;
   responseText: string;
@@ -478,6 +483,12 @@ export const sharedTaskAssignments: SharedTaskAssignment[] = [
     requiresFollowUp: true,
     draftSeed: {
       emailSent: true,
+      emailSubject: "Question about your recent booking decision",
+      emailBody:
+        "Hi Sara, I noticed you recently considered a travel booking. What made you pause or hesitate before confirming it?",
+      sentAt: "2026-03-31T08:20:00.000Z",
+      recipientReplyText: "",
+      replyReceivedAt: null,
       followUpComplete: false,
       proofReady: false,
       responseText: "",
